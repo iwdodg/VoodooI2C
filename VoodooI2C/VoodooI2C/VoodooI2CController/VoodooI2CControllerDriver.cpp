@@ -230,10 +230,44 @@ void VoodooI2CControllerDriver::handleAbortI2C() {
     IOLog("%s::%s I2C Transaction error: 0x%08x - aborting\n", getName(), bus_device.name, bus_device.abort_source);
 }
 
+#define kVoodooI2CControllerPollIntervalUS 200
+
 void VoodooI2CControllerDriver::handleInterrupt(OSObject* target, void* refCon, IOService* nubDevice, int source) {
     /* Direct interrupt context. Do NOT block the thread by memory allocation, IOLog, IOLockLock, command_gate->runAction, ... */
     nub->disableInterrupt(0);
+    serviceController();
+    nub->enableInterrupt(0);
+}
 
+void VoodooI2CControllerDriver::pollController(IOTimerEventSource* sender) {
+    /* Runs on the work loop while prepareTransferI2C sleeps on the command gate */
+    if (!controller_polling || !transfer_active || !bus_device.awake)
+        return;
+
+    serviceController();
+
+    if (transfer_active && poll_timer)
+        poll_timer->setTimeoutUS(kVoodooI2CControllerPollIntervalUS);
+}
+
+bool VoodooI2CControllerDriver::startControllerPolling() {
+    if (!poll_timer) {
+        poll_timer = IOTimerEventSource::timerEventSource(this,
+            OSMemberFunctionCast(IOTimerEventSource::Action, this, &VoodooI2CControllerDriver::pollController));
+        if (!poll_timer || work_loop->addEventSource(poll_timer) != kIOReturnSuccess) {
+            IOLog("%s::%s Could not set up controller polling\n", getName(), bus_device.name);
+            OSSafeReleaseNULL(poll_timer);
+            return false;
+        }
+    }
+
+    controller_polling = true;
+    setProperty("ControllerPollingMode", kOSBooleanTrue);
+    IOLog("%s::%s Controller interrupt unavailable, using controller polling mode\n", getName(), bus_device.name);
+    return true;
+}
+
+void VoodooI2CControllerDriver::serviceController() {
     UInt32 status, enabled;
 
     if (!bus_device.awake) {
@@ -274,7 +308,7 @@ wakeup:
     }
 
 exit:
-    nub->enableInterrupt(0);
+    return;
 }
 
 bool VoodooI2CControllerDriver::init(OSDictionary* properties) {
@@ -325,7 +359,11 @@ IOReturn VoodooI2CControllerDriver::prepareTransferI2C(VoodooI2CControllerBusMes
     bus_device.abort_source = 0;
     bus_device.receive_outstanding = 0;
 
+    transfer_active = true;
     requestTransferI2C();
+
+    if (controller_polling && poll_timer)
+        poll_timer->setTimeoutUS(kVoodooI2CControllerPollIntervalUS);
 
     /*
      * Sleep timeout to prevent the caller from deadlock :
@@ -335,6 +373,10 @@ IOReturn VoodooI2CControllerDriver::prepareTransferI2C(VoodooI2CControllerBusMes
     nanoseconds_to_absolutetime(1000000000, &abstime);
     clock_absolutetime_interval_to_deadline(abstime, &deadline);
     sleep = command_gate->commandSleep(&bus_device.command_complete, deadline, THREAD_INTERRUPTIBLE);
+
+    transfer_active = false;
+    if (controller_polling && poll_timer)
+        poll_timer->cancelTimeout();
 
     if (sleep == THREAD_TIMED_OUT) {
         IOLog("%s::%s Timeout waiting for bus to accept transfer request\n", getName(), bus_device.name);
@@ -507,6 +549,15 @@ void VoodooI2CControllerDriver::readFromBus() {
 void VoodooI2CControllerDriver::releaseResources() {
     stopI2CInterrupt();
 
+    controller_polling = false;
+    transfer_active = false;
+    if (poll_timer) {
+        poll_timer->cancelTimeout();
+        if (work_loop)
+            work_loop->removeEventSource(poll_timer);
+        OSSafeReleaseNULL(poll_timer);
+    }
+
     if (command_gate) {
         work_loop->removeEventSource(command_gate);
     }
@@ -584,7 +635,8 @@ IOReturn VoodooI2CControllerDriver::setPowerState(unsigned long whichState, IOSe
             initialiseBus();
             toggleInterrupts(kVoodooI2CStateOff);
             bus_device.awake = true;
-            startI2CInterrupt();
+            if (!controller_polling)
+                startI2CInterrupt();
             IOLog("%s::%s Woke up\n", getName(), bus_device.name);
         }
     }
@@ -647,7 +699,7 @@ bool VoodooI2CControllerDriver::start(IOService* provider) {
 
     toggleInterrupts(kVoodooI2CStateOff);
 
-    if (startI2CInterrupt() != kIOReturnSuccess) {
+    if (startI2CInterrupt() != kIOReturnSuccess && !startControllerPolling()) {
         goto exit;
     }
 

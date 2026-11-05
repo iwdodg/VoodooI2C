@@ -12,6 +12,7 @@
 #include <IOKit/IOLib.h>
 #include <IOKit/IOKitKeys.h>
 #include <IOKit/IOService.h>
+#include <IOKit/IOTimerEventSource.h>
 #include <IOKit/acpi/IOACPIPlatformDevice.h>
 
 #include "VoodooI2CControllerConstants.hpp"
@@ -86,6 +87,18 @@ class EXPORT VoodooI2CControllerDriver : public IOService {
 
     void handleInterrupt(OSObject* target, void* refCon, IOService* nubDevice, int source);
 
+    /* Services the controller's pending interrupt status. Shared by the
+     * interrupt handler and the controller polling timer.
+     */
+
+    void serviceController();
+
+    /* Timer action used when the controller's own interrupt cannot be
+     * registered (e.g. its APIC pin is above 0x2F, which macOS cannot route).
+     */
+
+    void pollController(IOTimerEventSource* sender);
+
     /* Initialises <VoodooI2CControllerDriver> class
      * @properties OSDictionary* representing the matched personality
      *
@@ -150,6 +163,17 @@ class EXPORT VoodooI2CControllerDriver : public IOService {
     IOWorkLoop* work_loop = nullptr;
     IOLock* i2c_bus_lock = nullptr;
     bool is_interrupt_registered = false;
+
+    /* Controller polling fallback */
+    IOTimerEventSource* poll_timer = nullptr;
+    bool controller_polling = false;
+    bool transfer_active = false;
+
+    /* Sets up the controller polling fallback on the driver's work loop
+     *
+     * @return *true* on success
+     */
+    bool startControllerPolling();
 
     /* Request a 32-bit value property from this service or any parent in the
      * IOService tree.
